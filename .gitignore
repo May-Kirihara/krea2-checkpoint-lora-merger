@@ -1,0 +1,33 @@
+# uv / Python
+.venv/
+.python-version
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# ツールキャッシュ
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+
+# 環境変数・シークレット
+.env
+.env.*
+
+# モデルファイル (巨大なためコミットしない)
+*.safetensors
+*.ckpt
+*.pt
+*.bin
+
+# 出力先ディレクトリ
+output/
+outputs/
+merged/
+
+# OS
+.DS_Store
+Thumbs.db
+merge-edit.sh
