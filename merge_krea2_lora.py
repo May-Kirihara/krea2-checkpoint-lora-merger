@@ -9,7 +9,12 @@ Supports:
   - LoRA: musubi-tuner format (lora_unet_...lora_down/lora_up) or
     ai-toolkit / PEFT format (diffusion_model....lora_A/lora_B), converted automatically
   - output: re-quantized to the same format as the base (default), int8+convrot
-    (--output-format int8), or plain BF16 (--output-format bf16)
+    (--output-format int8), plain BF16 (--output-format bf16), or a hybrid that
+    keeps quantization only where the LoRA delta survives re-quantization
+    (--output-format hybrid, promoting weak-SNR modules to BF16)
+  - re-quantization uses a per-row (int8) / per-tensor (fp8) MSE-optimal scale
+    grid search by default (--scale-search mse); alpha=1.0 (plain absmax) is
+    included in the grid, so results are never worse than min-max quantization
 
 The output is usable as a standalone DiT checkpoint without loading the LoRA again.
 """
@@ -44,12 +49,35 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--output-format",
-        choices=["same", "int8", "bf16"],
+        choices=["same", "int8", "bf16", "hybrid"],
         default="same",
         help=(
             "Output format. 'same': dequantize -> merge -> re-quantize each module to its "
             "original base format (int8+convrot or fp8; default). 'int8': re-quantize everything "
-            "to int8_tensorwise + convrot. 'bf16': plain BF16 checkpoint (no quant keys)."
+            "to int8_tensorwise + convrot. 'bf16': plain BF16 checkpoint (no quant keys). "
+            "'hybrid': keep each LoRA-touched module quantized only when the LoRA delta is "
+            "clearly larger than the re-quantization error (see --hybrid-snr); promote it to "
+            "BF16 otherwise. Untouched modules are always copied unchanged."
+        ),
+    )
+    p.add_argument(
+        "--scale-search",
+        choices=["mse", "off"],
+        default="mse",
+        help=(
+            "Scale selection when re-quantizing. 'mse': grid-search a clipping factor per row "
+            "(int8) / per tensor (fp8) over absmax*[0.5..1.0] and keep the scale with the "
+            "lowest reconstruction MSE (default). 'off': plain absmax scaling."
+        ),
+    )
+    p.add_argument(
+        "--hybrid-snr",
+        type=float,
+        default=2.0,
+        metavar="RATIO",
+        help=(
+            "hybrid output only: promote a LoRA-touched module to BF16 when "
+            "||LoRA delta|| / ||re-quantization error|| falls below this ratio (default 2.0)."
         ),
     )
     p.add_argument(
@@ -113,12 +141,36 @@ def dequantize_int8_convrot(q: torch.Tensor, scale: torch.Tensor, group_size: in
     return rotate_weight(q.to(torch.float32) * scale.to(torch.float32), h, group_size)
 
 
-def quantize_int8_convrot(w: torch.Tensor, group_size: int, h: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+# clipping-factor candidates for the MSE scale search; 1.0 reproduces plain
+# absmax quantization, so the search result is never worse than min-max
+_MSE_ALPHAS: Tuple[float, ...] = tuple(round(1.0 - 0.02 * i, 2) for i in range(26))
+
+
+def quantize_int8_convrot(
+    w: torch.Tensor, group_size: int, h: torch.Tensor, scale_search: bool = False
+) -> Tuple[torch.Tensor, torch.Tensor]:
     w_rot = rotate_weight(w, h, group_size)
     abs_max = w_rot.abs().amax(dim=-1, keepdim=True)
-    scale = (abs_max / 127.0).clamp(min=1e-30)
-    q = torch.round(w_rot / scale).clamp_(-128, 127).to(torch.int8)
-    return q, scale
+    if not scale_search:
+        scale = (abs_max / 127.0).clamp(min=1e-30)
+        q = torch.round(w_rot / scale).clamp_(-128, 127).to(torch.int8)
+        return q, scale
+    best_q: torch.Tensor | None = None
+    best_scale: torch.Tensor | None = None
+    best_err: torch.Tensor | None = None
+    for alpha in _MSE_ALPHAS:
+        scale = (abs_max * alpha / 127.0).clamp(min=1e-30)
+        q = torch.round(w_rot / scale).clamp(-128, 127)
+        err = (q * scale - w_rot).pow(2).sum(dim=-1, keepdim=True)
+        if best_err is None:
+            best_q, best_scale, best_err = q, scale, err
+            continue
+        better = err < best_err
+        best_q = torch.where(better, q, best_q)
+        best_scale = torch.where(better, scale, best_scale)
+        best_err = torch.where(better, err, best_err)
+    assert best_q is not None and best_scale is not None
+    return best_q.to(torch.int8), best_scale
 
 
 def parse_comfy_quant(t: torch.Tensor) -> dict:
@@ -146,11 +198,24 @@ def dequantize_fp8(w: torch.Tensor, scale: torch.Tensor, fmt: str) -> torch.Tens
     return w.to(torch.float32) * scale.to(torch.float32)
 
 
-def quantize_fp8(w: torch.Tensor, fmt: str) -> Tuple[torch.Tensor, torch.Tensor]:
+def quantize_fp8(w: torch.Tensor, fmt: str, scale_search: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
     dtype, fmax = FP8_TYPES[fmt]
-    scale = (w.abs().amax().to(torch.float32) / fmax).clamp(min=1e-30).reshape(())
-    q = torch.clamp(w * (1.0 / scale).to(w.dtype), -fmax, fmax).to(dtype)
-    return q, scale
+    absmax = w.abs().amax().to(torch.float32)
+    if not scale_search:
+        scale = (absmax / fmax).clamp(min=1e-30).reshape(())
+        q = torch.clamp(w * (1.0 / scale).to(w.dtype), -fmax, fmax).to(dtype)
+        return q, scale
+    best_q = None
+    best_scale = None
+    best_err = None
+    for alpha in _MSE_ALPHAS:
+        scale = ((absmax * alpha) / fmax).clamp(min=1e-30).reshape(())
+        q = torch.clamp(w * (1.0 / scale).to(w.dtype), -fmax, fmax).to(dtype)
+        err = ((q.to(torch.float32) * scale) - w).pow(2).sum()
+        if best_err is None or bool(err < best_err):
+            best_q, best_scale, best_err = q, scale, err
+    assert best_q is not None and best_scale is not None
+    return best_q, best_scale
 
 
 # ----------------------------------------------------------------------------
@@ -302,12 +367,26 @@ def main() -> None:
         fmt_counts[conf["format"]] = fmt_counts.get(conf["format"], 0) + 1
     group_sizes = {int(c.get("convrot_groupsize", 256)) for c in quant_conf.values() if c["format"] == "int8_tensorwise"}
     group_size = max(group_sizes) if group_sizes else 256
-    need_hadamard = any(c["format"] == "int8_tensorwise" for c in quant_conf.values()) or args.output_format == "int8"
-    h = build_hadamard(group_size).to(calc_device) if need_hadamard else None
+    h_cache: Dict[int, torch.Tensor] = {}
+
+    def get_h(size: int) -> torch.Tensor:
+        if size not in h_cache:
+            h_cache[size] = build_hadamard(size).to(calc_device)
+        return h_cache[size]
+
     if n_quant:
         print(f"      Base: {n_quant} quantized modules ({', '.join(f'{v}x {k}' for k, v in fmt_counts.items())})")
-        out_desc = {"same": "re-quantizing to the original formats", "int8": "re-quantizing to int8+convrot", "bf16": "saving as BF16"}[args.output_format]
+        out_desc = {
+            "same": "re-quantizing touched modules to their original formats",
+            "int8": "re-quantizing everything to int8+convrot",
+            "bf16": "saving as BF16",
+            "hybrid": "keeping quantization only where the LoRA survives it, BF16 otherwise",
+        }[args.output_format]
         print(f"      Dequantizing to FP32, merging LoRA, then {out_desc}")
+        extra = f"      Scale search: {args.scale_search}"
+        if args.output_format == "hybrid":
+            extra += f" (hybrid SNR threshold {args.hybrid_snr:g})"
+        print(extra)
 
     # ---- load LoRAs -----------------------------------------------------------
     all_lora_entries: List[Dict[str, List[Tuple[torch.Tensor, torch.Tensor, float]]]] = []
@@ -328,7 +407,7 @@ def main() -> None:
     # ---- merge -----------------------------------------------------------------
     print("[3/5] Merging LoRA into Krea2 Turbo weights...")
     merged_sd: Dict[str, torch.Tensor] = {}
-    n_requant = n_plain = 0
+    n_requant = n_plain = n_copied = n_promoted = 0
 
     def apply_loras(w: torch.Tensor, module: str) -> torch.Tensor:
         for entries, mult in zip(all_lora_entries, multipliers):
@@ -336,6 +415,18 @@ def main() -> None:
                 delta = (up.to(calc_device, torch.float32) @ down.to(calc_device, torch.float32)) * lscale
                 w = w + mult * delta
         return w
+
+    def module_touched(full_module: str) -> bool:
+        stripped = strip_base_prefix(full_module)
+        return any(entries.get(stripped) for entries in all_lora_entries)
+
+    def hybrid_keep_quantized(w_merged: torch.Tensor, w_base: torch.Tensor, recon: torch.Tensor) -> bool:
+        """Keep the module quantized when the LoRA delta clearly survives re-quantization."""
+        delta = float((w_merged - w_base).norm())
+        err = float((recon - w_merged).norm())
+        if delta == 0.0 or err == 0.0:
+            return True
+        return (delta / err) >= args.hybrid_snr
 
     with safe_open(str(base), framework="pt", device="cpu") as f:
         for key in f.keys():
@@ -348,45 +439,93 @@ def main() -> None:
             if module is not None and module in quant_conf:
                 conf = quant_conf[module]
                 in_fmt = conf["format"]
+                in_group = int(conf.get("convrot_groupsize", 256)) if in_fmt == "int8_tensorwise" else group_size
+                touched = module_touched(module)
+
+                # Resolve the per-module output format.
+                if args.output_format == "bf16":
+                    out_fmt = "bf16"
+                elif args.output_format == "int8":
+                    if not touched and in_fmt == "int8_tensorwise" and in_group == group_size:
+                        out_fmt = "copy"
+                    else:
+                        out_fmt = "int8_tensorwise"
+                else:  # same / hybrid
+                    out_fmt = "copy" if not touched else in_fmt
+
+                if out_fmt == "copy":
+                    # Untouched module: copy the base tensors verbatim (zero extra noise).
+                    merged_sd[key] = tensor
+                    merged_sd[module + ".weight_scale"] = f.get_tensor(module + ".weight_scale")
+                    merged_sd[module + ".comfy_quant"] = f.get_tensor(module + ".comfy_quant")
+                    n_copied += 1
+                    continue
+
+                out_group = group_size if args.output_format == "int8" else in_group
+                mse = args.scale_search == "mse"
                 scale = f.get_tensor(module + ".weight_scale")
                 w = tensor.to(calc_device)
                 if in_fmt == "int8_tensorwise":
-                    w = dequantize_int8_convrot(w, scale.to(calc_device), int(conf.get("convrot_groupsize", 256)), h)
+                    w = dequantize_int8_convrot(w, scale.to(calc_device), in_group, get_h(in_group))
                 else:
                     w = dequantize_fp8(w, scale.to(calc_device), in_fmt)
+                w_base = w
                 w = apply_loras(w, strip_base_prefix(module))
-                out_fmt = {"same": in_fmt, "int8": "int8_tensorwise", "bf16": "bf16"}[args.output_format]
-                if out_fmt == "int8_tensorwise":
-                    q, new_scale = quantize_int8_convrot(w, group_size, h)
+
+                if out_fmt == "bf16":
+                    merged_sd[key] = w.to("cpu", torch.bfloat16).contiguous()
+                    n_plain += 1
+                elif out_fmt == "int8_tensorwise":
+                    q, new_scale = quantize_int8_convrot(w, out_group, get_h(out_group), mse)
+                    if args.output_format == "hybrid":
+                        recon = dequantize_int8_convrot(q, new_scale, out_group, get_h(out_group))
+                        if not hybrid_keep_quantized(w, w_base, recon):
+                            merged_sd[key] = w.to("cpu", torch.bfloat16).contiguous()
+                            n_promoted += 1
+                            del w, w_base
+                            continue
                     merged_sd[key] = q.to("cpu").contiguous()
                     merged_sd[module + ".weight_scale"] = new_scale.to("cpu", torch.float32).contiguous()
                     merged_sd[module + ".comfy_quant"] = comfy_quant_tensor(
-                        {"format": "int8_tensorwise", "convrot": True, "convrot_groupsize": group_size}
+                        {"format": "int8_tensorwise", "convrot": True, "convrot_groupsize": out_group}
                     )
                     n_requant += 1
-                elif out_fmt in FP8_TYPES:
-                    q, new_scale = quantize_fp8(w, out_fmt)
-                    out_conf = dict(conf) if out_fmt == in_fmt else {"format": out_fmt}
+                else:  # fp8 out (same / hybrid keep the module's original fp8 format)
+                    q, new_scale = quantize_fp8(w, out_fmt, mse)
+                    if args.output_format == "hybrid":
+                        recon = dequantize_fp8(q, new_scale, out_fmt)
+                        if not hybrid_keep_quantized(w, w_base, recon):
+                            merged_sd[key] = w.to("cpu", torch.bfloat16).contiguous()
+                            n_promoted += 1
+                            del w, w_base
+                            continue
                     merged_sd[key] = q.to("cpu").contiguous()
                     merged_sd[module + ".weight_scale"] = new_scale.to("cpu", torch.float32).contiguous()
-                    merged_sd[module + ".comfy_quant"] = comfy_quant_tensor(out_conf)
+                    merged_sd[module + ".comfy_quant"] = comfy_quant_tensor(dict(conf))
                     n_requant += 1
+                del w, w_base
+            elif module is not None:
+                if not module_touched(module):
+                    merged_sd[key] = tensor
+                    n_copied += 1
                 else:
+                    w = apply_loras(tensor.to(calc_device, torch.float32), strip_base_prefix(module))
                     merged_sd[key] = w.to("cpu", torch.bfloat16).contiguous()
                     n_plain += 1
-                del w
-            elif module is not None:
-                w = apply_loras(tensor.to(calc_device, torch.float32), strip_base_prefix(module))
-                merged_sd[key] = w.to("cpu", torch.bfloat16).contiguous()
-                n_plain += 1
-                del w
+                    del w
             else:
                 merged_sd[key] = tensor  # norm scales, biases, mod.lin, ... kept as-is
 
     if calc_device.type == "cuda":
         torch.cuda.synchronize()
 
-    print(f"      {n_requant} modules merged + re-quantized, {n_plain} modules merged in BF16")
+    parts = [f"{n_requant} modules merged + re-quantized"]
+    if n_promoted:
+        parts.append(f"{n_promoted} modules promoted to BF16 (hybrid)")
+    parts.append(f"{n_plain} modules merged in BF16")
+    if n_copied:
+        parts.append(f"{n_copied} modules copied unchanged (no LoRA)")
+    print("      " + ", ".join(parts) + ".")
 
     # ---- save --------------------------------------------------------------------
     print("[4/5] Saving merged checkpoint...")
@@ -401,6 +540,8 @@ def main() -> None:
             "krea2_merge_loras": ";".join(lp.name for lp in lora_paths),
             "krea2_merge_multipliers": ";".join(f"{x:g}" for x in multipliers),
             "krea2_merge_output_format": args.output_format,
+            "krea2_merge_scale_search": args.scale_search,
+            "krea2_merge_hybrid_snr": f"{args.hybrid_snr:g}",
             "krea2_merge_tool": "merge_krea2_turbo_lora.py",
         }
     )

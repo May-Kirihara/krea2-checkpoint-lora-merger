@@ -79,7 +79,9 @@ python merge_krea2_turbo_lora.py \
 | `--lora` | (必須) | LoRA ファイル (複数指定可) |
 | `--multiplier` | 全部 1.0 | LoRA ごとの強度。個数が足りない分は 1.0 扱い |
 | `--output` | (必須) | 出力先。ベースと同じパスは拒否 |
-| `--output-format` | `same` | `same` / `int8` / `bf16` (下記参照) |
+| `--output-format` | `same` | `same` / `int8` / `bf16` / `hybrid` (下記参照) |
+| `--scale-search` | `mse` | 再量子化時のスケール決定。`mse`: int8は行ごと、fp8はテンソルごとに `absmax×[0.5..1.0]` のグリッドから再構成MSE最小のスケールを選択 (absmax=1.0を含むため悪化しない)。`off`: 従来の absmax |
+| `--hybrid-snr` | `2.0` | `hybrid` 専用。`‖LoRA差分‖ / ‖再量子化誤差‖` がこの値未満のモジュールを BF16 に昇格 |
 | `--calc-device` | `auto` | 行列演算デバイス。`auto` は CUDA があれば使用 |
 | `--force` | off | 出力先が既に存在しても上書き |
 
@@ -87,9 +89,10 @@ python merge_krea2_turbo_lora.py \
 
 | 値 | 動作 | サイズ目安 | 品質 |
 |---|---|---|---|
-| `same` | 各モジュールをベースと同じ量子化形式で再量子化 | base と同程度 | 再量子化ノイズあり |
-| `int8` | すべて int8_tensorwise + convrot (group 256) に変換 | 約 1/2 | 再量子化ノイズあり |
+| `same` | LoRA適用モジュールをベースと同じ量子化形式で再量子化。未適用モジュールは無変換でコピー | base と同程度 | 再量子化ノイズあり (MSEスケール探索で低減) |
+| `int8` | すべて int8_tensorwise + convrot に変換。未適用の int8 モジュールはコピー | 約 1/2 | 再量子化ノイズあり (MSEスケール探索で低減) |
 | `bf16` | 非量子化 BF16 として出力 (`comfy_quant` / `weight_scale` は削除) | 約 2 倍 | ノイズなし |
+| `hybrid` | LoRA適用モジュールを SNR 判定: 差分が再量子化誤差に埋もれるモジュールのみ BF16 へ昇格、残りは元の量子化形式を維持。未適用モジュールは無変換コピー | base〜bf16 の間 (LoRAの強度依存) | 昇格モジュールは無劣化 |
 
 - ベースが非量子化の場合、`same` は `bf16` 相当になります。
 - ComfyUI はモジュールごとに `comfy_quant` の有無を判定するため、量子化 / 非量子化が混在したチェックポイントも問題なくロードできます。
@@ -98,14 +101,19 @@ python merge_krea2_turbo_lora.py \
 
 量子化モジュールは以下のパイプラインで処理します (FP32 はすべて float32 演算)。
 
-1. **デ量子化**
+1. **Dequantize**
    - int8 + convrot: `W = rotate(q.float() × weight_scale, H, group_size)`
      - `H` は正規化直交 Hadamard 行列 (group_size = 256 なら Kronecker 冪 `h4⊗h4⊗h4⊗h4 / 16`)。H は対称かつ直交なので回転は自己逆変換になります。
    - FP8: `W = w.float() × weight_scale` (per-tensor スケール)
 2. **LoRA マージ**: `W ← W + multiplier × (lora_up @ lora_down) × (alpha / rank)`
-3. **再量子化**
-   - int8 + convrot: `W` を回転 → 行ごとに `scale = absmax / 127` → 四捨五入して clamp(-128, 127)
-   - FP8: `scale = absmax / 448` (e4m3) または `/ 57344` (e5m2) → clamp のうえ FP8 へキャスト
+3. **Re-quantization**
+   - int8 + convrot: `W` を回転 → 行ごとにスケールを決定 → 四捨五入して clamp(-128, 127)
+   - FP8: per-tensor スケールを決定 → clamp のうえ FP8 へキャスト
+   - スケール決定はデフォルトで MSE 探索 (`--scale-search mse`): クリッピング率 α を 1.00〜0.50 (0.02 刻み) で試し、再構成MSE が最小のスケールを行ごと (int8) / テンソルごと (fp8) に採用します。α=1.0 (absmax) が候補に含まれるため、必ず absmax 以下の誤差になります。
+
+LoRA を適用しないモジュールの量子化テンソル (`weight` / `weight_scale` / `comfy_quant`) は一切触らずそのままコピーします (再量子化ノイズゼロ)。
+
+`hybrid` の判定: LoRA 適用モジュールを実際に再量子化してみて、`‖LoRA差分‖ / ‖再量子化誤差‖` が `--hybrid-snr` (デフォルト 2.0) 未満なら BF16 に昇格します。差分がノイズに埋もれるモジュールだけを高精度化する、サイズと品質の折り合いを取るモードです。
 
 デ量子化・再量子化の実装は ComfyUI の `comfy_kitchen` (eager 実装) とビット一致することを検証済みです。スカラー係数は厳密には `Σ mult × (U @ D) × alpha/rank` の順で FP32 加算します。
 
@@ -114,8 +122,9 @@ python merge_krea2_turbo_lora.py \
 ## 品質に関する注意
 
 - 量子化形式で出力する場合、マージ後の重みを再度量子化するため、量子化誤差 (ノイズ) が乗ります。これはベースチェックポイント自体が持っている誤差と同種・同程度のものです。
-- FP8 (e4m3) は約 3 bit 仮数のため誤差が大きめです。弱い LoRA (差分の最大値が重み標準偏差の数%程度) だと、LoRA の効果が再量子化ノイズに埋もれ気味になることがあります。確実に効果を残したい場合は `--output-format bf16` を使ってください。
-- int8 (行単位スケール) は FP8 より高精度で、サイズも同じく約 1/2 です。
+- FP8 (e4m3) は約 3 bit 仮数のため誤差が大きめです。弱い LoRA (差分の最大値が重み標準偏差の数%程度) だと、LoRA の効果が再量子化ノイズに埋もれ気味になることがあります。
+- int8 (行単位スケール) は FP8 より高精度で、サイズも同じく約 1/2 です。ただし弱めの LoRA・低 multiplier では差分と再量子化ノイズが同程度になることがあります (実測例: int8ベース + スタイルLoRA ×0.7 で全モジュールの SNR 中央値 ≈ 1.3)。
+- ForgeNEO 等の実行時LoRA適用と一致させたい場合は `--output-format bf16` が完全一致、`hybrid` はSNRが閾値未満のモジュールのみ完全一致になります。`hybrid` はLoRAが弱いほど昇格モジュールが増えて bf16 に近いサイズ・品質になり、強い LoRA では量子化サイズを維持したまま劣化モジュールだけ救済します。サイズ優先なら `--hybrid-snr` を下げてください (例: 1.0 なら差分がノイズ以上のモジュールは量子化維持)。
 
 ## 制限事項
 

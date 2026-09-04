@@ -79,7 +79,9 @@ The easiest way is to write the command into `merge.sh` and run it.
 | `--lora` | (required) | LoRA file(s); multiple can be specified |
 | `--multiplier` | all 1.0 | Per-LoRA strength. Missing entries are treated as 1.0 |
 | `--output` | (required) | Output path. Identical to the base path is rejected |
-| `--output-format` | `same` | `same` / `int8` / `bf16` (see below) |
+| `--output-format` | `same` | `same` / `int8` / `bf16` / `hybrid` (see below) |
+| `--scale-search` | `mse` | Scale selection when re-quantizing. `mse`: grid-search a clipping factor per row (int8) / per tensor (fp8) over `absmax*[0.5..1.0]` and keep the scale with the lowest reconstruction MSE (absmax = 1.0 is in the grid, so it is never worse). `off`: plain absmax |
+| `--hybrid-snr` | `2.0` | `hybrid` only. Promote a module to BF16 when `‖LoRA delta‖ / ‖re-quantization error‖` falls below this |
 | `--calc-device` | `auto` | Device for matrix math. `auto` uses CUDA when available |
 | `--force` | off | Overwrite an existing output file |
 
@@ -87,9 +89,10 @@ The easiest way is to write the command into `merge.sh` and run it.
 
 | Value | Behavior | Approx. size | Quality |
 |---|---|---|---|
-| `same` | Re-quantizes each module in the same format as the base | same as base | requantization noise |
-| `int8` | Converts everything to int8_tensorwise + convrot (group 256) | ~1/2 | requantization noise |
+| `same` | Re-quantizes LoRA-touched modules in the same format as the base; untouched modules are copied unchanged | same as base | requantization noise (reduced by the MSE scale search) |
+| `int8` | Converts everything to int8_tensorwise + convrot; untouched int8 modules are copied | ~1/2 | requantization noise (reduced by the MSE scale search) |
 | `bf16` | Outputs unquantized BF16 (`comfy_quant` / `weight_scale` are removed) | ~2x | no noise |
+| `hybrid` | Per-module SNR test on LoRA-touched modules: promote to BF16 only where the delta would be buried in requantization noise; keep the original quantized format elsewhere. Untouched modules are copied unchanged | between base and bf16 (depends on LoRA strength) | promoted modules are lossless |
 
 - If the base is unquantized, `same` behaves like `bf16`.
 - ComfyUI checks `comfy_quant` per module, so checkpoints mixing quantized / unquantized modules load fine.
@@ -104,8 +107,13 @@ Quantized modules go through the following pipeline (all FP32 math is float32).
    - FP8: `W = w.float() × weight_scale` (per-tensor scale)
 2. **LoRA merge**: `W ← W + multiplier × (lora_up @ lora_down) × (alpha / rank)`
 3. **Re-quantization**
-   - int8 + convrot: rotate `W` → per row `scale = absmax / 127` → round and clamp(-128, 127)
-   - FP8: `scale = absmax / 448` (e4m3) or `/ 57344` (e5m2) → clamp, then cast to FP8
+   - int8 + convrot: rotate `W` → choose a per-row scale → round and clamp(-128, 127)
+   - FP8: choose a per-tensor scale → clamp, then cast to FP8
+   - By default the scale is chosen by MSE search (`--scale-search mse`): clipping factors α from 1.00 down to 0.50 (step 0.02) are tried and the scale with the lowest reconstruction MSE is kept per row (int8) / per tensor (fp8). Since α = 1.0 (absmax) is in the grid, the result is never worse than plain absmax.
+
+Quantized tensors of modules the LoRA does not touch (`weight` / `weight_scale` / `comfy_quant`) are copied byte-for-byte with zero extra noise.
+
+`hybrid` decision: each LoRA-touched module is tentatively re-quantized; if `‖LoRA delta‖ / ‖re-quantization error‖` falls below `--hybrid-snr` (default 2.0) the module is promoted to BF16 instead — trading size for fidelity only where the delta would be buried in noise.
 
 The dequantization/requantization implementations are verified to be bit-exact against ComfyUI's `comfy_kitchen` (eager implementation). Scalar coefficients are strictly accumulated in FP32 in the order `Σ mult × (U @ D) × alpha/rank`.
 
@@ -114,8 +122,9 @@ Unquantized modules are merged in FP32 and saved as BF16 (the LoRA deltas are ve
 ## Quality Notes
 
 - When outputting in a quantized format, the merged weights are quantized again, which adds quantization error (noise) — of the same kind and magnitude as the base checkpoint itself already carries.
-- FP8 (e4m3) has a ~3-bit mantissa and thus larger errors. With weak LoRAs (max delta on the order of a few percent of the weight standard deviation), the LoRA effect can get buried in requantization noise. Use `--output-format bf16` when you want to preserve the effect reliably.
-- int8 (per-row scaling) is more accurate than FP8 at the same ~1/2 size.
+- FP8 (e4m3) has a ~3-bit mantissa and thus larger errors. With weak LoRAs (max delta on the order of a few percent of the weight standard deviation), the LoRA effect can get buried in requantization noise.
+- int8 (per-row scaling) is more accurate than FP8 at the same ~1/2 size. Note, however, that with weak LoRAs or low multipliers the delta can be comparable to the requantization noise (measured example: int8 base + style LoRA ×0.7 gave a per-module SNR median of ≈ 1.3).
+- To match runtime LoRA application (ForgeNEO etc.) exactly, use `--output-format bf16`. `hybrid` matches exactly on every module it promotes; weak LoRAs promote most modules (approaching bf16 size/quality), strong LoRAs keep the quantized size while rescuing only the degraded modules. Lower `--hybrid-snr` (e.g. 1.0 keeps a module quantized as long as the delta is at least at the noise floor) to prioritize size.
 
 ## Limitations
 
