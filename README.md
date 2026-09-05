@@ -31,7 +31,7 @@ uv pip install safetensors
 ### Running
 
 ```bash
-uv run python merge_krea2_turbo_lora.py --help
+uv run python merge_krea2_lora.py --help
 ```
 
 ## Supported Formats
