@@ -62,7 +62,7 @@ uv run python merge_krea2_turbo_lora.py --help
 ## Usage
 
 ```bash
-python merge_krea2_turbo_lora.py \
+python merge_krea2_lora.py \
     --base  <base_checkpoint.safetensors> \
     --lora  <LoRA1.safetensors> <LoRA2.safetensors> ... \
     --multiplier 0.7 0.6 ... \
