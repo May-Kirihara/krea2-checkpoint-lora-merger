@@ -79,7 +79,7 @@ The easiest way is to write the command into `merge.sh` and run it.
 | `--lora` | (required) | LoRA file(s); multiple can be specified |
 | `--multiplier` | all 1.0 | Per-LoRA strength. Missing entries are treated as 1.0 |
 | `--output` | (required) | Output path. Identical to the base path is rejected |
-| `--output-format` | `same` | `same` / `int8` / `bf16` / `hybrid` (see below) |
+| `--output-format` | `hybrid` | `same` / `int8` / `bf16` / `hybrid` (see below) |
 | `--scale-search` | `mse` | Scale selection when re-quantizing. `mse`: grid-search a clipping factor per row (int8) / per tensor (fp8) over `absmax*[0.5..1.0]` and keep the scale with the lowest reconstruction MSE (absmax = 1.0 is in the grid, so it is never worse). `off`: plain absmax |
 | `--hybrid-snr` | `2.0` | `hybrid` only. Promote a module to BF16 when `‖LoRA delta‖ / ‖re-quantization error‖` falls below this |
 | `--calc-device` | `auto` | Device for matrix math. `auto` uses CUDA when available |

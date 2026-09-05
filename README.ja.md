@@ -79,7 +79,7 @@ python merge_krea2_lora.py \
 | `--lora` | (必須) | LoRA ファイル (複数指定可) |
 | `--multiplier` | 全部 1.0 | LoRA ごとの強度。個数が足りない分は 1.0 扱い |
 | `--output` | (必須) | 出力先。ベースと同じパスは拒否 |
-| `--output-format` | `same` | `same` / `int8` / `bf16` / `hybrid` (下記参照) |
+| `--output-format` | `hybrid` | `same` / `int8` / `bf16` / `hybrid` (下記参照) |
 | `--scale-search` | `mse` | 再量子化時のスケール決定。`mse`: int8は行ごと、fp8はテンソルごとに `absmax×[0.5..1.0]` のグリッドから再構成MSE最小のスケールを選択 (absmax=1.0を含むため悪化しない)。`off`: 従来の absmax |
 | `--hybrid-snr` | `2.0` | `hybrid` 専用。`‖LoRA差分‖ / ‖再量子化誤差‖` がこの値未満のモジュールを BF16 に昇格 |
 | `--calc-device` | `auto` | 行列演算デバイス。`auto` は CUDA があれば使用 |

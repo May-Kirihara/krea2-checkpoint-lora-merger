@@ -8,10 +8,11 @@ Supports:
   - base key prefixes "model.diffusion_model." / "diffusion_model." are handled
   - LoRA: musubi-tuner format (lora_unet_...lora_down/lora_up) or
     ai-toolkit / PEFT format (diffusion_model....lora_A/lora_B), converted automatically
-  - output: re-quantized to the same format as the base (default), int8+convrot
-    (--output-format int8), plain BF16 (--output-format bf16), or a hybrid that
-    keeps quantization only where the LoRA delta survives re-quantization
-    (--output-format hybrid, promoting weak-SNR modules to BF16)
+  - output: a hybrid that keeps quantization only where the LoRA delta
+    survives re-quantization (default; --output-format hybrid, promoting
+    weak-SNR modules to BF16), re-quantized to the same format as the base
+    (--output-format same), int8+convrot (--output-format int8), or plain
+    BF16 (--output-format bf16)
   - re-quantization uses a per-row (int8) / per-tensor (fp8) MSE-optimal scale
     grid search by default (--scale-search mse); alpha=1.0 (plain absmax) is
     included in the grid, so results are never worse than min-max quantization
@@ -50,14 +51,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--output-format",
         choices=["same", "int8", "bf16", "hybrid"],
-        default="same",
+        default="hybrid",
         help=(
-            "Output format. 'same': dequantize -> merge -> re-quantize each module to its "
-            "original base format (int8+convrot or fp8; default). 'int8': re-quantize everything "
-            "to int8_tensorwise + convrot. 'bf16': plain BF16 checkpoint (no quant keys). "
-            "'hybrid': keep each LoRA-touched module quantized only when the LoRA delta is "
-            "clearly larger than the re-quantization error (see --hybrid-snr); promote it to "
-            "BF16 otherwise. Untouched modules are always copied unchanged."
+            "Output format. 'hybrid': keep each LoRA-touched module quantized only "
+            "when the LoRA delta is clearly larger than the re-quantization error "
+            "(see --hybrid-snr); promote it to BF16 otherwise (default). 'same': "
+            "dequantize -> merge -> re-quantize each module to its original base "
+            "format (int8+convrot or fp8). 'int8': re-quantize everything to "
+            "int8_tensorwise + convrot. 'bf16': plain BF16 checkpoint (no quant "
+            "keys). Untouched modules are always copied unchanged."
         ),
     )
     p.add_argument(
